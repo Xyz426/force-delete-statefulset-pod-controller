@@ -22,7 +22,6 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req reconcile.Request) (r
 	pod := &corev1.Pod{}
 	err := r.Get(ctx, req.NamespacedName, pod)
 	if apierrors.IsNotFound(err) {
-		logger.Info("Pod not found")
 		return reconcile.Result{}, nil
 	}
 
@@ -35,21 +34,22 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req reconcile.Request) (r
 		return reconcile.Result{}, nil
 	}
 
+	// Ensure the Pod is in the "price-engine" namespace
+	if pod.Namespace != "app" {
+		logger.Info("Pod is not in application namespaces, skipping", "namespace", pod.Namespace)
+		return reconcile.Result{}, nil
+	}
+
 	if pod.ObjectMeta.DeletionTimestamp != nil {
 		nodeName := pod.Spec.NodeName
-		if nodeName == "" {
-			logger.Info("Pod has not been scheduled to a node, skipping force delete", "pod", pod.Name)
-			return reconcile.Result{}, nil
-		}
 		var node corev1.Node
 		nodeErr := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node)
-		if apierrors.IsNotFound(nodeErr) {
-			logger.Info("Pod's node unhealthy, force deleting pod", "pod", pod.Name, "node", nodeName)
-			err = r.Delete(ctx, pod, client.GracePeriodSeconds(0))
-			if err != nil {
-				logger.Error(err, "Failed to force delete Statefulset pod", "pod", pod.Name, "node", nodeName)
+		if apierrors.IsNotFound(nodeErr) || !isNodeReady(&node) {
+			logger.Info("Pod's node unhealthy or not ready, force deleting pod", "pod", pod.Name, "node", nodeName)
+			if err := r.Delete(ctx, pod, client.GracePeriodSeconds(0)); err != nil {
 				return reconcile.Result{}, err
 			}
+			return reconcile.Result{}, nil
 		}
 
 		if nodeErr != nil {
@@ -57,7 +57,7 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req reconcile.Request) (r
 			return reconcile.Result{}, nodeErr
 		}
 
-		logger.Info("Pod still terminating, but node exists; will try again", "pod", pod.Name)
+		logger.Info("Pod status is terminating, but node is healthy", "pod", pod.Name)
 		return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
@@ -71,8 +71,18 @@ func (r *PodReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func isPodManagedByStatefulSet(pod *corev1.Pod) bool {
-	for _, owner := range pod.OwnerReferences {
-		if owner.Kind == "StatefulSet" {
+    for _, owner := range pod.OwnerReferences {
+        if owner.Kind == "StatefulSet" && owner.Controller != nil && *owner.Controller {
+            return true
+        }
+    }
+    return false
+}
+
+// isNodeReady checks if the node is in Ready state
+func isNodeReady(node *corev1.Node) bool {
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
 			return true
 		}
 	}
